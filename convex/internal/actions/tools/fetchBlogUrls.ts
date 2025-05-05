@@ -1,8 +1,8 @@
-import { internalAction } from '../_generated/server';
+import { internalAction } from '../../../_generated/server'; // Corrected path
 import { v } from 'convex/values';
 import { z } from 'zod';
-import fetch from 'node-fetch';
-import cheerio from 'cheerio';
+import fetch from 'node-fetch'; // Using node-fetch
+import * as cheerio from 'cheerio'; // Using cheerio
 
 // Input validation schema
 const QuerySchema = z.string().min(1, 'Query must not be empty');
@@ -11,7 +11,7 @@ const QuerySchema = z.string().min(1, 'Query must not be empty');
 const UrlListSchema = z.array(z.string().url());
 
 // Configuration constants
-const SEARCH_ENGINE = 'google';
+const SEARCH_ENGINE = 'google'; // Can be 'google' or 'bing'
 const MAX_RESULTS = 5;
 const SEARCH_URLS = {
   google: 'https://www.google.com/search?q={}',
@@ -20,7 +20,8 @@ const SEARCH_URLS = {
 
 // Helper function to encode query with filters
 function encodeQuery(query: string): string {
-  const filters = ' site:*.edu | site:*.org | site:*.com -inurl:(signup | login | shop)';
+  // Example filters: prioritize .edu/.org, exclude common non-content pages
+  const filters = ' site:*.edu | site:*.org | site:*.com -inurl:(signup|login|shop|product|cart)';
   return encodeURIComponent(`${query}${filters}`);
 }
 
@@ -29,71 +30,90 @@ export const fetchBlogUrls = internalAction({
   args: {
     query: v.string(),
   },
-  handler: async (_ctx, args) => {
+  handler: async (_ctx, args): Promise<string[]> => { // Return type is string[]
     // Validate input
     try {
       QuerySchema.parse(args.query);
     } catch (error) {
-      console.error('Invalid query:', error);
-      return [];
+      const message = error instanceof z.ZodError ? error.errors.map(e => e.message).join(', ') : 'Unknown validation error';
+      console.error('Invalid query:', message);
+      throw new Error(`Invalid query: ${message}`); // Throw for workflow handling
     }
 
-    console.log(`Fetching blog URLs for query: ${args.query}`);
+    console.log(`Workspaceing blog URLs for query: "${args.query}"`);
 
     const scrapflyApiKey = process.env.SCRAPFLY_API_KEY;
     if (!scrapflyApiKey) {
       console.error('SCRAPFLY_API_KEY is not set');
-      return [];
+      throw new Error('Configuration error: Missing SCRAPFLY_API_KEY'); // Throw for workflow handling
     }
 
     const baseUrl = SEARCH_URLS[SEARCH_ENGINE];
     const encodedQuery = encodeQuery(args.query);
-    const url = baseUrl.replace('{}', encodedQuery);
+    const searchUrl = baseUrl.replace('{}', encodedQuery);
 
+    // Define Scrapfly configurations to try
     const configs = [
-      { renderJs: true, asp: true },
-      { renderJs: false, asp: true },
-      { renderJs: false, asp: false },
+      { renderJs: true, asp: true, country: 'US' }, // JS rendering, ASP enabled
+      { renderJs: false, asp: true, country: 'US' }, // No JS, ASP enabled
+      { renderJs: false, asp: false, country: 'US' }, // Basic scrape
     ];
 
     let results: string[] = [];
 
     for (let attempt = 0; attempt < configs.length; attempt++) {
       const config = configs[attempt];
-      console.log(`Attempt ${attempt + 1} with config:`, config);
+      console.log(`Attempt ${attempt + 1}/${configs.length} using config: ${JSON.stringify(config)}`);
 
       try {
-        const scrapflyUrl = `https://api.scrapfly.io/scrape?key=${scrapflyApiKey}&url=${encodeURIComponent(url)}&render_js=${config.renderJs}&asp=${config.asp}&country=US&cache=true`;
+        // Construct Scrapfly API URL for this attempt
+        const scrapflyUrl = `https://api.scrapfly.io/scrape?key=${scrapflyApiKey}&url=${encodeURIComponent(searchUrl)}&render_js=${config.renderJs}&asp=${config.asp}&country=${config.country}&cache=true`;
+
         const response = await fetch(scrapflyUrl);
 
         if (!response.ok) {
-          console.warn(`Scrapfly request failed with status: ${response.status}`);
-          continue;
+          console.warn(`Scrapfly request failed (Attempt ${attempt + 1}) with status: ${response.status}`);
+          continue; // Try next configuration
         }
 
-        const data = await response.json();
-        console.log(`Scrapfly response status: ${data.result.status_code}`);
+        const data = await response.json() as any; // Use 'any' carefully or define a ScrapflyResponse type
 
-        const $ = cheerio.load(data.result.content);
+        // Basic check on Scrapfly response structure
+        if (!data?.result?.content) {
+            console.warn(`Scrapfly response (Attempt ${attempt + 1}) missing result.content`);
+            continue;
+        }
+
+        console.log(`Scrapfly response status (Attempt ${attempt + 1}): ${data.result.status_code || 'N/A'}`);
+        const htmlContent = data.result.content;
+        const $ = cheerio.load(htmlContent);
 
         const linkElements: { href: string; title: string }[] = [];
+
+        // Common selectors for Google/Bing search results
         const selectors = [
-          'div[data-ved] a[href^="http"]',
-          'div.g a[href^="http"]',
-          'li.b_algo a[href^="http"]',
+          'div[data-ved] a[href^="http"]', // Google specific structure
+          'div.g a[href^="http"]',         // General Google structure
+          'li.b_algo a[href^="http"]',     // Bing specific structure
+          'a[href][ping]',                 // Links with tracking pings
         ];
 
         selectors.forEach((selector) => {
           $(selector).each((_, elem) => {
             const href = $(elem).attr('href') || '';
             let title = '';
+
+            // Try finding title within common heading tags inside or near the link
             const titleElem = $(elem).find('h3, h2').first();
             if (titleElem.length) {
               title = titleElem.text().trim();
             } else {
-              const parent = $(elem).parent().find('h3, h2').first();
-              title = parent.length ? parent.text().trim() : $(elem).text().trim();
+              // Look broader if title not directly inside
+              const parentHeadings = $(elem).closest('div, li').find('h3, h2').first();
+              title = parentHeadings.length ? parentHeadings.text().trim() : $(elem).text().trim();
             }
+
+            // Truncate long titles
             if (title.length > 200) {
               title = title.slice(0, 200) + '...';
             }
@@ -101,52 +121,74 @@ export const fetchBlogUrls = internalAction({
           });
         });
 
-        console.log(`Found ${linkElements.length} potential links`);
+        console.log(`Found ${linkElements.length} potential links in attempt ${attempt + 1}`);
 
+        const seenUrls = new Set<string>();
         for (const link of linkElements) {
           let cleanUrl = link.href;
-          if (cleanUrl.includes('/url?q=')) {
-            cleanUrl = decodeURIComponent(cleanUrl.split('/url?q=')[1].split('&')[0]);
-          }
 
+          // Clean Google redirect URLs
+          if (cleanUrl.includes('/url?q=')) {
+            try {
+                const urlParams = new URLSearchParams(cleanUrl.split('?')[1]);
+                const targetUrl = urlParams.get('q');
+                if (targetUrl) {
+                    cleanUrl = targetUrl;
+                }
+            } catch (e) {
+                // Ignore invalid URL parameters
+            }
+          }
+          // Decode URL just in case
+          cleanUrl = decodeURIComponent(cleanUrl);
+
+          // Validate and filter URL
           if (
-            cleanUrl.startsWith('http://') ||
-            cleanUrl.startsWith('https://') &&
+            (cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://')) &&
+            !seenUrls.has(cleanUrl) &&
             !cleanUrl.toLowerCase().includes('google.com') &&
             !cleanUrl.toLowerCase().includes('bing.com') &&
+            !cleanUrl.toLowerCase().includes('microsoft.com') &&
+            !cleanUrl.toLowerCase().includes('/search?') && // Exclude search result pages
             !cleanUrl.toLowerCase().includes('/signup') &&
             !cleanUrl.toLowerCase().includes('/login') &&
-            !cleanUrl.toLowerCase().includes('/shop/') &&
+            !cleanUrl.toLowerCase().includes('/shop') &&
             !cleanUrl.toLowerCase().includes('/product') &&
-            link.title
+            !cleanUrl.toLowerCase().includes('/cart') &&
+            link.title // Require some extracted title text
           ) {
             results.push(cleanUrl);
+            seenUrls.add(cleanUrl);
           }
 
           if (results.length >= MAX_RESULTS) {
-            break;
+            break; // Stop once we have enough results
           }
         }
 
-        if (results.length > 0) {
-          break;
+        if (results.length >= MAX_RESULTS) {
+          console.log(`Reached MAX_RESULTS (${MAX_RESULTS}) in attempt ${attempt + 1}.`);
+          break; // Exit the loop if enough results are found
         }
 
       } catch (error) {
-        console.error(`Error in attempt ${attempt + 1}:`, error);
-        if (attempt === configs.length - 1) {
-          console.warn('All attempts failed');
-        }
+        console.error(`Error during Scrapfly request or parsing (Attempt ${attempt + 1}):`, error);
+        // Continue to next attempt
       }
     }
 
-    // Validate output
+    if (results.length === 0) {
+        console.warn('All scraping attempts failed or yielded no valid URLs.');
+    }
+
+    // Validate output before returning
     try {
       const validatedResults = UrlListSchema.parse(results.slice(0, MAX_RESULTS));
-      console.log('Final validated results:', validatedResults);
+      console.log(`Final validated URLs (${validatedResults.length}):`, validatedResults);
       return validatedResults;
     } catch (error) {
       console.error('Output validation failed:', error);
+      // Return empty array or throw, depending on desired workflow behavior
       return [];
     }
   },
